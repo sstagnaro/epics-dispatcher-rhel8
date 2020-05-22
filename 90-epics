@@ -1,0 +1,59 @@
+#!/bin/sh -e
+
+# Copy this script under dispatcher.d
+# in order to be called when an interface goes up / down
+# cp 90-epics /etc/NetworkManager/dispatcher.d/
+
+# Also copy/symlink this script under pre-down.d/
+# in order to hit the dispatcher "pre-down" action, needed for rules deletion:
+# ln -s /etc/NetworkManager/dispatcher.d/90-epics pre-down.d/
+
+# Author: Stefano Stagnaro <sstagnar@redhat.com>
+# based on the original script made by Ralph Lange <Ralph.Lange@gmx.de>
+
+# Make any incoming Channel Access name resolution queries go to the broadcast address
+# (to hit all IOCs on this host)
+
+# Change this if you run CA on a non-standard port
+PORT=5064
+
+IFACE=$1
+MODE=$2
+
+if [ "$IFACE" = "lo" ]; then
+    echo "Nothing to do with the loopback interface"
+    exit 0
+fi
+
+IP_OUT=$(ip -4 -o addr show $IFACE)
+IP_ADDR=$(echo $IP_OUT | grep -Po 'inet \K[\d.]+')
+IP_BCAST=$(echo $IP_OUT |  grep -Po 'brd \K[\d.]+')
+
+# Capture rules matching criteria already present in the PREROUTING chain
+ALL_HANDLERS=( $(nft -a list chain ip nat PREROUTING 2> /dev/null | grep "ip daddr $IP_ADDR udp dport $PORT counter.*dnat to $IP_BCAST" | sed 's/.*# handle //' | tr '\n' ' ') )
+
+if [ "$MODE" = "up" ] && [ -n "$IP_ADDR" ] && [ -n "$IP_BCAST" ]; then
+    if [ -z "$ALL_HANDLERS" ]; then # let's try to be idempotent
+        nft add rule ip nat PREROUTING ip daddr $IP_ADDR udp dport $PORT counter dnat to $IP_BCAST
+    else
+        echo "NAT rule already present, skipping"
+	exit 2
+    fi
+elif [ "$MODE" = "pre-down" ]; then
+    if [ -n "$ALL_HANDLERS" ]; then
+	for THIS_HANDLER in "${ALL_HANDLERS[@]}"; do # clean all rule duplicates
+            nft delete rule ip nat PREROUTING handle $THIS_HANDLER
+	done
+    else
+	echo "No rules to delete matching criteria"
+        exit 3
+    fi
+elif [ "$MODE" = "down" ]; then # can't handle action "down" since ip addresses are altready lost
+    echo "Nothing to do with action \"down\""
+    exit 0
+else
+    echo "Bad arguments"
+    exit 4
+fi
+
+exit 0
